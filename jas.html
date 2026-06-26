@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Track-Locking Spectrum Array (Pro Audio)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%;
+    height: 100%;
+    background: #000000;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+    cursor: pointer;
+  }
+
+  #overlay-container {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+
+  canvas {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    z-index: 1;
+    pointer-events: none;
+    transition: transform 0.08s cubic-bezier(0.1, 0.9, 0.2, 1);
+  }
+
+  #start-prompt {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.85);
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    color: #ffffff;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    font-weight: bold;
+    text-align: center;
+    padding: 20px;
+    transition: opacity 0.5s;
+  }
+  #start-prompt p { font-size: 14px; margin-bottom: 15px; }
+  #start-prompt span { font-size: 11px; color: #888; }
+  
+  #status-indicator {
+    position: absolute;
+    bottom: 20px;
+    left: 20px;
+    color: rgba(255, 255, 255, 0.3);
+    font-size: 10px;
+    letter-spacing: 1px;
+    z-index: 5;
+  }
+</style>
+</head>
+<body>
+
+<div id="start-prompt">
+  <p>🎵 Click to connect audio engine 🎵</p>
+  <span>Listening to default microphone / virtual cable input</span>
+</div>
+
+<div id="overlay-container">
+  <canvas id="spectrumCanvas"></canvas>
+  <div id="status-indicator">ENGINE: STANDBY</div>
+</div>
+
+<script>
+const canvas = document.getElementById('spectrumCanvas');
+const ctx = canvas.getContext('2d');
+const startPrompt = document.getElementById('start-prompt');
+const statusIndicator = document.getElementById('status-indicator');
+
+let time = 0;
+let numBars = 0;
+let barHeights = [];
+
+// Audio Variables
+let audioCtx = null;
+let analyser = null;
+let dataArray = null;
+let isAudioInitialized = false;
+
+// Track Logic & State Machine
+let trackState = 'ANALYZING'; // 'SILENCE', 'ANALYZING', 'PLAYING'
+let silenceTimer = 0;
+let analysisTimer = 0;
+
+let smoothBass = 0;
+let smoothMid = 0;
+let smoothTreble = 0;
+
+// Shockwave Interpolation Variables
+let oldWeights = { center: 1, classic: 0, edge: 0 };
+let targetWeights = { center: 1, classic: 0, edge: 0 };
+let rippleProgress = 2.0; // 2.0 means animation is finished
+
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+
+  // Reduced the number of bars (wider width)
+  const barWidth = 8; 
+  const gap = 4;
+  numBars = Math.ceil(canvas.width / (barWidth + gap));
+
+  if (barHeights.length !== numBars) {
+    barHeights = new Float32Array(numBars);
+  }
+}
+window.addEventListener('resize', resize);
+resize();
+
+window.addEventListener('click', async () => {
+  if (isAudioInitialized) return;
+
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 1024; 
+
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    const source = audioCtx.createMediaStreamSource(stream);
+    source.connect(analyser);
+
+    dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+    startPrompt.style.opacity = '0';
+    setTimeout(() => startPrompt.style.display = 'none', 500);
+    isAudioInitialized = true;
+  } catch (err) {
+    console.error("Audio Access Denied:", err);
+    alert("Audio capture canceled. Make sure to allow microphone access in your browser.");
+  }
+});
+
+function draw() {
+  time++;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const w = canvas.width;
+  const h = canvas.height;
+  const barWidth = 8; 
+  const gap = 4;
+  const totalBarWidth = barWidth + gap;
+
+  // Progress the shockwave animation
+  if (rippleProgress < 2.0) {
+    rippleProgress += 0.015; // Speed of the wave
+  }
+
+  let globalBassTrigger = 0;
+
+  if (isAudioInitialized && analyser) {
+    analyser.getByteFrequencyData(dataArray);
+
+    // --- 1. SILENCE DETECTION & TRACK LOGIC ---
+    let totalE = 0;
+    for(let i = 0; i < 200; i++) totalE += dataArray[i];
+    let avgEnergy = totalE / 200;
+
+    // If extremely quiet (gap between songs)
+    if (avgEnergy < 4) {
+      silenceTimer++;
+      if (silenceTimer > 90 && trackState !== 'SILENCE') { // 1.5 seconds of quiet
+        trackState = 'SILENCE';
+        statusIndicator.innerText = "ENGINE: WAITING FOR TRACK";
+      }
+    } else {
+      // Audio detected. If we were in silence, a new song just started!
+      if (trackState === 'SILENCE') {
+        trackState = 'ANALYZING';
+        statusIndicator.innerText = "ENGINE: ANALYZING GENRE...";
+        analysisTimer = 0;
+        smoothBass = smoothMid = smoothTreble = 0; // Reset history
+      }
+      silenceTimer = 0;
+    }
+
+    // --- 2. AUDIO CLASSIFICATION (Only runs for first 2 seconds of song) ---
+    if (trackState === 'ANALYZING') {
+      analysisTimer++;
+
+      let bAvg = 0, mAvg = 0, tAvg = 0;
+      for(let i=1; i<=8; i++) bAvg += dataArray[i];        
+      for(let i=20; i<=70; i++) mAvg += dataArray[i];      
+      for(let i=120; i<=250; i++) tAvg += dataArray[i];    
+      
+      bAvg /= 8; mAvg /= 50; tAvg /= 130;
+
+      smoothBass += (bAvg - smoothBass) * 0.05;
+      smoothMid += ((mAvg * 1.4) - smoothMid) * 0.05; 
+      smoothTreble += ((tAvg * 1.9) - smoothTreble) * 0.05;
+
+      // After 2 seconds, lock it in
+      if (analysisTimer > 120) { 
+        let maxEnergy = Math.max(smoothBass, smoothMid, smoothTreble);
+        
+        oldWeights = { ...targetWeights }; // Save current state to morph FROM
+        targetWeights = { center: 0, classic: 0, edge: 0 };
+        
+        if (maxEnergy === smoothBass) { targetWeights.edge = 1; statusIndicator.innerText = "ENGINE: LOCKED (HEAVY BASS)"; }
+        else if (maxEnergy === smoothMid) { targetWeights.center = 1; statusIndicator.innerText = "ENGINE: LOCKED (MID/VOCALS)"; }
+        else { targetWeights.classic = 1; statusIndicator.innerText = "ENGINE: LOCKED (TREBLE/ACOUSTIC)"; }
+        
+        trackState = 'PLAYING';
+        rippleProgress = 0.0; // Fire the shockwave transition!
+      }
+    }
+
+    // --- 3. PHYSICAL IMPACT TRIGGERS ---
+    globalBassTrigger = (dataArray[1] + dataArray[2] + dataArray[3] + dataArray[4]) / 4;
+
+    let scaleMultiplier = 1.0;
+    if (globalBassTrigger > 210) {
+      let punch = (globalBassTrigger - 210) / 45;
+      scaleMultiplier = 1.0 + (punch * 0.035);
+    }
+    canvas.style.transform = `scale(${scaleMultiplier})`;
+
+    if (globalBassTrigger > 230) {
+      let flashOpacity = ((globalBassTrigger - 230) / 25) * 0.12;
+      ctx.fillStyle = `rgba(255, 255, 255, ${flashOpacity})`;
+      ctx.fillRect(0, 0, w, h);
+    }
+  } else {
+    canvas.style.transform = `scale(1.0)`;
+  }
+
+  // --- 4. RENDER LOOP WITH SHOCKWAVE MATH ---
+  for (let i = 0; i < numBars; i++) {
+    let x_norm = i / numBars; 
+    let barPos = Math.abs(x_norm - 0.5) * 2; // Distance from center (0 to 1)
+
+    // Calculate how much this specific bar has been "hit" by the shockwave
+    let blend = Math.max(0, Math.min(1, (rippleProgress - barPos) * 6));
+    
+    // Create a brightness surge right at the tip of the shockwave
+    let rippleGlow = 0;
+    if (rippleProgress < 1.5) {
+      let distToRipple = Math.abs(rippleProgress - barPos);
+      if (distToRipple < 0.1) {
+        rippleGlow = 1.0 - (distToRipple / 0.1); 
+      }
+    }
+
+    // Morph the layout weights for THIS SPECIFIC BAR
+    let w_center = (oldWeights.center * (1 - blend)) + (targetWeights.center * blend);
+    let w_classic = (oldWeights.classic * (1 - blend)) + (targetWeights.classic * blend);
+    let w_edge = (oldWeights.edge * (1 - blend)) + (targetWeights.edge * blend);
+
+    let fdCenter = Math.abs(x_norm - 0.5) * 2;
+    let fdClassic = x_norm;
+    let fdEdge = 1.0 - (Math.abs(x_norm - 0.5) * 2);
+
+    let freqDist = (fdCenter * w_center) + (fdClassic * w_classic) + (fdEdge * w_edge);
+
+    let rawHeight = 0;
+
+    if (isAudioInitialized && dataArray && trackState !== 'SILENCE') {
+      let sampleIndex = Math.floor(Math.pow(freqDist, 1.6) * 280);
+      sampleIndex = Math.max(0, Math.min(sampleIndex, dataArray.length - 1));
+
+      let amplitude = dataArray[sampleIndex] / 255;
+
+      if (freqDist < 0.20) rawHeight = Math.pow(amplitude, 1.4) * (h * 0.50); 
+      else if (freqDist < 0.60) rawHeight = amplitude * (h * 0.35);                
+      else rawHeight = (amplitude * (1 + freqDist)) * (h * 0.25); 
+    } else {
+      // Idle animation when track ends
+      rawHeight = Math.abs(Math.sin(i * 0.1 + time * 0.03)) * 10 * (1 - freqDist);
+    }
+
+    // Add physical height surge from the shockwave
+    rawHeight += rippleGlow * (h * 0.15);
+
+    let attackSpeed = 0.85;
+    let releaseSpeed = 0.15 + (freqDist * 0.2); 
+
+    if (rawHeight > barHeights[i]) barHeights[i] += (rawHeight - barHeights[i]) * attackSpeed;
+    else barHeights[i] += (rawHeight - barHeights[i]) * releaseSpeed;
+
+    let calculatedHeight = Math.max(2, barHeights[i]);
+    const x = i * totalBarWidth;
+
+    let intensity = Math.min(1, calculatedHeight / (h * 0.35));
+    
+    // Add brightness from shockwave
+    let finalAlpha = 0.25 + (intensity * 0.75) + (rippleGlow * 0.5);
+
+    ctx.fillStyle = `rgba(255, 255, 255, ${finalAlpha})`;
+    if (intensity > 0.4 || rippleGlow > 0.2) {
+      ctx.shadowBlur = 10 + (intensity * 15) + (rippleGlow * 30);
+      ctx.shadowColor = `rgba(255, 255, 255, ${Math.min(1, finalAlpha * 1.2)})`;
+    } else {
+      ctx.shadowBlur = 0;
+    }
+
+    let tY_center = (h / 2) - (calculatedHeight / 2);
+    let tH_center = calculatedHeight / 2;
+    let bY_center = h / 2;
+    let bH_center = calculatedHeight / 2;
+
+    let tY_classic = h - calculatedHeight;
+    let tH_classic = calculatedHeight;
+    let bY_classic = h; 
+    let bH_classic = 0; 
+
+    let tY_edge = 0;
+    let tH_edge = calculatedHeight / 2;
+    let bY_edge = h - (calculatedHeight / 2);
+    let bH_edge = calculatedHeight / 2;
+
+    // Apply the localized morphing math to the geometry
+    let tY = (tY_center * w_center) + (tY_classic * w_classic) + (tY_edge * w_edge);
+    let tH = (tH_center * w_center) + (tH_classic * w_classic) + (tH_edge * w_edge);
+    let bY = (bY_center * w_center) + (bY_classic * w_classic) + (bY_edge * w_edge);
+    let bH = (bH_center * w_center) + (bH_classic * w_classic) + (bH_edge * w_edge);
+
+    ctx.fillRect(x, tY, barWidth, tH);
+    ctx.fillRect(x, bY, barWidth, bH);
+  }
+
+  requestAnimationFrame(draw);
+}
+
+function boot() {
+  draw();
+}
+boot();
+</script>
+</body>
+</html>
